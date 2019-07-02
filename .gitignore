@@ -7,5 +7,4 @@ _obj
 6.out
 gorptest.bin
 tmp
-.idea
-coverage.out
+*.swp

@@ -18,7 +18,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"log"
 	"reflect"
 	"strconv"
 	"strings"
@@ -35,8 +34,6 @@ import (
 //     dbmap := &gorp.DbMap{Db: db, Dialect: dialect}
 //
 type DbMap struct {
-	ctx context.Context
-
 	// Db handle to use with this map
 	Db *sql.DB
 
@@ -45,56 +42,7 @@ type DbMap struct {
 
 	TypeConverter TypeConverter
 
-	// ExpandSlices when enabled will convert slice arguments in mappers into flat
-	// values. It will modify the query, adding more placeholders, and the mapper,
-	// adding each item of the slice as a new unique entry in the mapper. For
-	// example, given the scenario bellow:
-	//
-	//     dbmap.Select(&output, "SELECT 1 FROM example WHERE id IN (:IDs)", map[string]interface{}{
-	//       "IDs": []int64{1, 2, 3},
-	//     })
-	//
-	// The executed query would be:
-	//
-	//     SELECT 1 FROM example WHERE id IN (:IDs0,:IDs1,:IDs2)
-	//
-	// With the mapper:
-	//
-	//     map[string]interface{}{
-	//       "IDs":  []int64{1, 2, 3},
-	//       "IDs0": int64(1),
-	//       "IDs1": int64(2),
-	//       "IDs2": int64(3),
-	//     }
-	//
-	// It is also flexible for custom slice types. The value just need to
-	// implement stringer or numberer interfaces.
-	//
-	//     type CustomValue string
-	//
-	//     const (
-	//       CustomValueHey CustomValue = "hey"
-	//       CustomValueOh  CustomValue = "oh"
-	//     )
-	//
-	//     type CustomValues []CustomValue
-	//
-	//     func (c CustomValues) ToStringSlice() []string {
-	//       values := make([]string, len(c))
-	//       for i := range c {
-	//         values[i] = string(c[i])
-	//       }
-	//       return values
-	//     }
-	//
-	//     func query() {
-	//       // ...
-	//       result, err := dbmap.Select(&output, "SELECT 1 FROM example WHERE value IN (:Values)", map[string]interface{}{
-	//         "Values": CustomValues([]CustomValue{CustomValueHey}),
-	//       })
-	//       // ...
-	//     }
-	ExpandSliceArgs bool
+	QueryTimeout time.Duration
 
 	tables        []*TableMap
 	tablesDynamic map[string]*TableMap // tables that use same go-struct and different db table names
@@ -124,14 +72,8 @@ func (m *DbMap) dynamicTableMap() map[string]*TableMap {
 	return m.tablesDynamic
 }
 
-func (m *DbMap) WithContext(ctx context.Context) SqlExecutor {
-	copy := &DbMap{}
-	*copy = *m
-	copy.ctx = ctx
-	return copy
-}
-
 func (m *DbMap) CreateIndex() error {
+
 	var err error
 	dialect := reflect.TypeOf(m.Dialect)
 	for _, table := range m.tables {
@@ -181,7 +123,7 @@ func (m *DbMap) createIndexImpl(dialect reflect.Type,
 		s.WriteString(fmt.Sprintf(" %s %s", m.Dialect.CreateIndexSuffix(), index.IndexType))
 	}
 	s.WriteString(";")
-	_, err := m.Exec(s.String())
+	_, err := m.ExecNoTimeout(s.String())
 	return err
 }
 
@@ -198,7 +140,7 @@ func (t *TableMap) DropIndex(name string) error {
 				s.WriteString(fmt.Sprintf(" %s %s", t.dbmap.Dialect.DropIndexSuffix(), t.TableName))
 			}
 			s.WriteString(";")
-			_, e := t.dbmap.Exec(s.String())
+			_, e := t.dbmap.ExecNoTimeout(s.String())
 			if e != nil {
 				err = e
 			}
@@ -376,9 +318,6 @@ func (m *DbMap) readStructColumns(t reflect.Type) (cols []*ColumnMap, primaryKey
 			}
 			if typer, ok := value.(SqlTyper); ok {
 				gotype = reflect.TypeOf(typer.SqlType())
-			} else if typer, ok := value.(legacySqlTyper); ok {
-				log.Printf("Deprecation Warning: update your SqlType methods to return a driver.Value")
-				gotype = reflect.TypeOf(typer.SqlType())
 			} else if valuer, ok := value.(driver.Valuer); ok {
 				// Only check for driver.Valuer if SqlTyper wasn't
 				// found.
@@ -441,7 +380,7 @@ func (m *DbMap) createTables(ifNotExists bool) error {
 	for i := range m.tables {
 		table := m.tables[i]
 		sql := table.SqlForCreate(ifNotExists)
-		_, err = m.Exec(sql)
+		_, err = m.ExecNoTimeout(sql)
 		if err != nil {
 			return err
 		}
@@ -449,7 +388,7 @@ func (m *DbMap) createTables(ifNotExists bool) error {
 
 	for _, tbl := range m.dynamicTableMap() {
 		sql := tbl.SqlForCreate(ifNotExists)
-		_, err = m.Exec(sql)
+		_, err = m.ExecNoTimeout(sql)
 		if err != nil {
 			return err
 		}
@@ -531,7 +470,7 @@ func (m *DbMap) dropTableImpl(table *TableMap, ifExists bool) (err error) {
 	if ifExists {
 		tableDrop = m.Dialect.IfTableExists(tableDrop, table.SchemaName, table.TableName)
 	}
-	_, err = m.Exec(fmt.Sprintf("%s %s;", tableDrop, m.Dialect.QuotedTableForQuery(table.SchemaName, table.TableName)))
+	_, err = m.ExecNoTimeout(fmt.Sprintf("%s %s;", tableDrop, m.Dialect.QuotedTableForQuery(table.SchemaName, table.TableName)))
 	return err
 }
 
@@ -543,14 +482,14 @@ func (m *DbMap) TruncateTables() error {
 	var err error
 	for i := range m.tables {
 		table := m.tables[i]
-		_, e := m.Exec(fmt.Sprintf("%s %s;", m.Dialect.TruncateClause(), m.Dialect.QuotedTableForQuery(table.SchemaName, table.TableName)))
+		_, e := m.ExecNoTimeout(fmt.Sprintf("%s %s;", m.Dialect.TruncateClause(), m.Dialect.QuotedTableForQuery(table.SchemaName, table.TableName)))
 		if e != nil {
 			err = e
 		}
 	}
 
 	for _, table := range m.dynamicTableMap() {
-		_, e := m.Exec(fmt.Sprintf("%s %s;", m.Dialect.TruncateClause(), m.Dialect.QuotedTableForQuery(table.SchemaName, table.TableName)))
+		_, e := m.ExecNoTimeout(fmt.Sprintf("%s %s;", m.Dialect.TruncateClause(), m.Dialect.QuotedTableForQuery(table.SchemaName, table.TableName)))
 		if e != nil {
 			err = e
 		}
@@ -656,87 +595,61 @@ func (m *DbMap) Get(i interface{}, keys ...interface{}) (interface{}, error) {
 //
 // i does NOT need to be registered with AddTable()
 func (m *DbMap) Select(i interface{}, query string, args ...interface{}) ([]interface{}, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return hookedselect(m, m, i, query, args...)
 }
 
 // Exec runs an arbitrary SQL statement.  args represent the bind parameters.
 // This is equivalent to running:  Exec() using database/sql
+// Times out based on the DbMap.QueryTimeout field
 func (m *DbMap) Exec(query string, args ...interface{}) (sql.Result, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	if m.logger != nil {
 		now := time.Now()
 		defer m.trace(now, query, args...)
 	}
-	return maybeExpandNamedQueryAndExec(m, query, args...)
+	return exec(m, query, true, args...)
+}
+
+// ExecNoTimeout is the same as Exec except it will not time out
+func (m *DbMap) ExecNoTimeout(query string, args ...interface{}) (sql.Result, error) {
+	if m.logger != nil {
+		now := time.Now()
+		defer m.trace(now, query, args...)
+	}
+	return exec(m, query, false, args...)
 }
 
 // SelectInt is a convenience wrapper around the gorp.SelectInt function
 func (m *DbMap) SelectInt(query string, args ...interface{}) (int64, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return SelectInt(m, query, args...)
 }
 
 // SelectNullInt is a convenience wrapper around the gorp.SelectNullInt function
 func (m *DbMap) SelectNullInt(query string, args ...interface{}) (sql.NullInt64, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return SelectNullInt(m, query, args...)
 }
 
 // SelectFloat is a convenience wrapper around the gorp.SelectFloat function
 func (m *DbMap) SelectFloat(query string, args ...interface{}) (float64, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return SelectFloat(m, query, args...)
 }
 
 // SelectNullFloat is a convenience wrapper around the gorp.SelectNullFloat function
 func (m *DbMap) SelectNullFloat(query string, args ...interface{}) (sql.NullFloat64, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return SelectNullFloat(m, query, args...)
 }
 
 // SelectStr is a convenience wrapper around the gorp.SelectStr function
 func (m *DbMap) SelectStr(query string, args ...interface{}) (string, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return SelectStr(m, query, args...)
 }
 
 // SelectNullStr is a convenience wrapper around the gorp.SelectNullStr function
 func (m *DbMap) SelectNullStr(query string, args ...interface{}) (sql.NullString, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return SelectNullStr(m, query, args...)
 }
 
 // SelectOne is a convenience wrapper around the gorp.SelectOne function
 func (m *DbMap) SelectOne(holder interface{}, query string, args ...interface{}) error {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	return SelectOne(m, m, holder, query, args...)
 }
 
@@ -746,15 +659,11 @@ func (m *DbMap) Begin() (*Transaction, error) {
 		now := time.Now()
 		defer m.trace(now, "begin;")
 	}
-	tx, err := begin(m)
+	tx, err := m.Db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	return &Transaction{
-		dbmap:  m,
-		tx:     tx,
-		closed: false,
-	}, nil
+	return &Transaction{m, tx, false}, nil
 }
 
 // TableFor returns the *TableMap corresponding to the given Go Type
@@ -802,7 +711,7 @@ func (m *DbMap) Prepare(query string) (*sql.Stmt, error) {
 		now := time.Now()
 		defer m.trace(now, query, nil)
 	}
-	return prepare(m, query)
+	return m.Db.Prepare(query)
 }
 
 func tableOrNil(m *DbMap, t reflect.Type, name string) *TableMap {
@@ -851,142 +760,44 @@ func (m *DbMap) tableForPointer(ptr interface{}, checkPK bool) (*TableMap, refle
 }
 
 func (m *DbMap) QueryRow(query string, args ...interface{}) *sql.Row {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	if m.logger != nil {
 		now := time.Now()
 		defer m.trace(now, query, args...)
 	}
-	return queryRow(m, query, args...)
+
+	return m.Db.QueryRow(query, args...)
 }
 
-func (m *DbMap) Query(q string, args ...interface{}) (*sql.Rows, error) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&q, args...)
-	}
-
+func (m *DbMap) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	if m.logger != nil {
 		now := time.Now()
-		defer m.trace(now, q, args...)
+		defer m.trace(now, query, args...)
 	}
-	return query(m, q, args...)
+
+	return m.Db.QueryRowContext(ctx, query, args...)
+}
+
+func (m *DbMap) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	if m.logger != nil {
+		now := time.Now()
+		defer m.trace(now, query, args...)
+	}
+
+	return m.Db.Query(query, args...)
+}
+
+func (m *DbMap) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if m.logger != nil {
+		now := time.Now()
+		defer m.trace(now, query, args...)
+	}
+
+	return m.Db.QueryContext(ctx, query, args...)
 }
 
 func (m *DbMap) trace(started time.Time, query string, args ...interface{}) {
-	if m.ExpandSliceArgs {
-		expandSliceArgs(&query, args...)
-	}
-
 	if m.logger != nil {
 		var margs = argsString(args...)
 		m.logger.Printf("%s%s [%s] (%v)", m.logPrefix, query, margs, (time.Now().Sub(started)))
-	}
-}
-
-type stringer interface {
-	ToStringSlice() []string
-}
-
-type numberer interface {
-	ToInt64Slice() []int64
-}
-
-func expandSliceArgs(query *string, args ...interface{}) {
-	for _, arg := range args {
-		mapper, ok := arg.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		for key, value := range mapper {
-			var replacements []string
-
-			// add flexibility for any custom type to be convert to one of the
-			// acceptable formats.
-			if v, ok := value.(stringer); ok {
-				value = v.ToStringSlice()
-			}
-			if v, ok := value.(numberer); ok {
-				value = v.ToInt64Slice()
-			}
-
-			switch v := value.(type) {
-			case []string:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []uint:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []uint8:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []uint16:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []uint32:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []uint64:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []int:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []int8:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []int16:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []int32:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []int64:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []float32:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			case []float64:
-				for id, replace := range v {
-					mapper[fmt.Sprintf("%s%d", key, id)] = replace
-					replacements = append(replacements, fmt.Sprintf(":%s%d", key, id))
-				}
-			default:
-				continue
-			}
-
-			if len(replacements) == 0 {
-				continue
-			}
-
-			*query = strings.Replace(*query, fmt.Sprintf(":%s", key), strings.Join(replacements, ","), -1)
-		}
 	}
 }
